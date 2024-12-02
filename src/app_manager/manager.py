@@ -3,329 +3,412 @@ from __future__ import annotations
 import itertools
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Dict, List, Optional
 
-import psutil  # conda install psutil -c conda-forge
+import psutil
 import streamlit as st
-import yaml  # conda install pyyaml -c conda-forge
+import yaml
 from streamlit.components.v1 import html
 
 try:
-    import gpustat  # conda install gpustat -c conda-forge
+    import gpustat
+
+    GPUSTAT_AVAILABLE = True
 except ImportError:
-    _gpustat_available = False
-else:
-    _gpustat_available = True
+    GPUSTAT_AVAILABLE = False
 
-conda_activate = "~/mambaforge/etc/profile.d/conda.sh"
+CONDA_ACTIVATE_SCRIPT = os.path.expanduser("~/mambaforge/etc/profile.d/conda.sh")
+LOCAL_IP = "http://localhost"
+LAN_IP = "http://192.168.40.191"
+WAN_IP = "http://24.239.193.76"
 
-local_ip = "http://localhost"
-lan_ip = "http://192.168.40.191"
-wan_ip = "http://24.239.193.76"
+STARTUP_SCRIPTS_FOLDER = os.path.abspath("./startup_scripts")
+LOGS_FOLDER = os.path.abspath("./logs")
+CONFIG_FILE = os.path.abspath("apps.yml")
 
-startup_scripts_folder = "./startup_scripts"
-logs_folder = "./logs"
-
-os.makedirs(startup_scripts_folder, exist_ok=True)
-os.makedirs(logs_folder, exist_ok=True)
+os.makedirs(STARTUP_SCRIPTS_FOLDER, exist_ok=True)
+os.makedirs(LOGS_FOLDER, exist_ok=True)
 
 
-def app_kill(app_info):
-    # TODO: It seems that calling kill on the psutil process object doesn't work
-    # to kill subprocesses (seems to be an issue for FastAPI apps), so we need to
-    # use the PID instead, which subprocesses share.
-    # app_info["Process"].kill()
-    os.kill(app_info["PID"], 9)
+class AppType(Enum):
+    STREAMLIT = "streamlit"
+    FASTAPI = "fastapi"
+    PYTHON = "python"  # For arbitrary Python scripts
+    FLASK = "flask"
+
+
+class EnvironmentType(Enum):
+    CONDA = "conda"
+    VENV = "venv"
 
 
 @dataclass
-class Process:
+class AppConfig:
+    name: str
+    file_path: str
+    port: Optional[int]
+    environment_name: str
+    environment_type: EnvironmentType = EnvironmentType.CONDA
+    app_type: AppType = AppType.STREAMLIT
+    category: str = "Uncategorized"
+    flags: List[str] = field(default_factory=list)
+    environment_variables: Dict[str, str] = field(default_factory=dict)
+    working_directory: Optional[str] = None
+
+    @staticmethod
+    def from_dict(name: str, config: Dict) -> AppConfig:
+        return AppConfig(
+            name=name,
+            file_path=config["File"],
+            port=config.get("Port"),
+            environment_name=config["Environment"],
+            environment_type=EnvironmentType(config.get("EnvironmentType", "conda").lower()),
+            app_type=AppType(config.get("Type", "streamlit").lower()),
+            category=config.get("Category", "Uncategorized"),
+            flags=config.get("Flags", []),
+            environment_variables=config.get("EnvironmentVariables", {}),
+            working_directory=config.get("WorkingDirectory"),
+        )
+
+
+@dataclass
+class ManagedProcess:
     pid: int
-    cmdline: list[str]
+    cmdline: List[str]
     name: Optional[str] = None
     status: Optional[str] = None
     started: Optional[float] = None
-    _memory_percent: Optional[float] = None
-    _connections: Optional[list[psutil._common.pconn]] = None
-    # Preserve a reference to the psutil process object in case we need it
-    psutil_proc: Optional[psutil.Process] = None
+    memory_percent: float = 0.0
+    gpu_memory: int = 0
+    process: Optional[psutil.Process] = field(default=None, repr=False)
 
     @classmethod
-    def from_psutil_process(cls, p: psutil.Process):
-        # Considerably speeds up the retrieval of multiple process information
-        # at the same time.
+    def from_psutil_process(cls, p: psutil.Process) -> ManagedProcess:
         with p.oneshot():
+            gpu_mem = 0
+            if GPUSTAT_AVAILABLE:
+                try:
+                    gpu = gpustat.new_query().jsonify()["gpus"][0]
+                    for proc in gpu["processes"]:
+                        if proc["pid"] == p.pid:
+                            gpu_mem = proc["gpu_memory_usage"]
+                            break
+                except Exception:
+                    pass
             return cls(
                 pid=p.pid,
                 cmdline=p.cmdline(),
                 name=p.name(),
                 status=p.status(),
                 started=p.create_time(),
-                psutil_proc=p,
+                memory_percent=p.memory_percent(),
+                gpu_memory=gpu_mem,
+                process=p,
             )
 
-    @property
-    def connections(self):
-        if self._connections is None:
-            if self.psutil_proc is not None:
-                try:
-                    self._connections = self.psutil_proc.connections()
-                except psutil.AccessDenied:
-                    self._connections = []
+
+class ConfigManager:
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.apps: List[AppConfig] = []
+
+    def load_config(self) -> None:
+        if not os.path.exists(self.config_path):
+            st.error("No apps.yml file found. Please create one.")
+            example_config = """\
+# apps.yml
+# Example configuration file for Streamlit App Manager
+# Each app should be a new entry in the yaml file
+Test App:
+  File: /path/to/test_app.py
+  Port: 8501
+  Environment: [conda|venv] env_name | path/to/venv/bin/activate
+  EnvironmentType: [conda|venv]
+  Type: [streamlit|fastapi|flask|python]
+  Category: Uncategorized
+  Flags: []
+  EnvironmentVariables: {}
+  WorkingDirectory: /path/to/working/directory
+"""
+            st.code(example_config, language="yaml")
+            st.stop()
+
+        with open(self.config_path, "r") as f:
+            raw_apps = yaml.safe_load(f)
+
+        self.apps = [AppConfig.from_dict(name, cfg) for name, cfg in raw_apps.items()]
+
+
+class ProcessManager:
+    def __init__(self):
+        self.processes: List[ManagedProcess] = self._get_managed_processes()
+
+    def _get_managed_processes(self) -> List[ManagedProcess]:
+        managed = []
+        for p in psutil.process_iter(['pid', 'cmdline', 'name', 'status', 'create_time']):
+            try:
+                managed.append(ManagedProcess.from_psutil_process(p))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return managed
+
+    def find_app_process(self, app: AppConfig) -> Optional[ManagedProcess]:
+        for proc in self.processes:
+            cmdline_str = " ".join(proc.cmdline).lower()
+            # If the app has a port, use it to identify the process
+            if app.port and str(app.port) in cmdline_str:
+                if (
+                    app.app_type == AppType.STREAMLIT
+                    and "streamlit" in cmdline_str
+                    and os.path.basename(app.file_path).lower() in cmdline_str
+                ):
+                    return proc
+                elif app.app_type == AppType.FASTAPI and "uvicorn" in cmdline_str:
+                    return proc
+                elif app.app_type == AppType.FLASK and "gunicorn" in cmdline_str:
+                    return proc
             else:
-                self._connections = []
+                # For apps without ports, use the file path to identify the process
+                if (
+                    app.app_type == AppType.PYTHON
+                    and os.path.abspath(app.file_path) in [os.path.abspath(arg) for arg in proc.cmdline]
+                ):
+                    return proc
+                elif (
+                    app.app_type == AppType.PYTHON
+                    and os.path.basename(app.file_path).lower() in cmdline_str
+                ):
+                    return proc
+        return None
 
-        return self._connections
+    def kill_process(self, proc: ManagedProcess) -> bool:
+        try:
+            proc.process.terminate()
+            proc.process.wait(timeout=5)
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            try:
+                proc.process.kill()
+                return True
+            except Exception:
+                return False
 
-    @property
-    def memory_percent(self):
-        if self._memory_percent is None:
-            if self.psutil_proc is not None:
-                self._memory_percent = self.psutil_proc.memory_percent()
-            else:
-                self._memory_percent = 0
 
-        return self._memory_percent
+class AppLauncher:
+    def __init__(self, startup_folder: str, logs_folder: str):
+        self.startup_folder = startup_folder
+        self.logs_folder = logs_folder
 
-    @property
-    def gpu_memory(self):
-        if _gpustat_available:
+    def build_startup_script(self, app: AppConfig) -> str:
+        script_lines = ["#!/bin/bash\n"]
+
+        # Export environment variables
+        for key, value in app.environment_variables.items():
+            script_lines.append(f"export {key}={value}\n")
+
+        # Activate environment
+        if app.environment_type == EnvironmentType.CONDA:
+            script_lines.append(f"source {CONDA_ACTIVATE_SCRIPT} && conda activate {app.environment_name} && \\\n")
+        elif app.environment_type == EnvironmentType.VENV:
+            script_lines.append(f"source {app.environment_name} && \\\n")
+
+        # Change working directory
+        working_dir = app.working_directory or os.path.dirname(app.file_path)
+        script_lines.append(f"cd {working_dir} && \\\n")
+
+        # Construct command based on app type
+        if app.app_type == AppType.STREAMLIT:
+            cmd = (
+                f"streamlit run {app.file_path} "
+                f"--server.port={app.port} "
+                f"--server.fileWatcherType=none "
+                f"--server.headless=true "
+                f"--browser.gatherUsageStats=false"
+            )
+        elif app.app_type == AppType.FASTAPI:
+            module_name = os.path.splitext(os.path.basename(app.file_path))[0]
+            cmd = f"uvicorn {module_name}:app --host 0.0.0.0 --port {app.port}"
+        elif app.app_type == AppType.FLASK:
+            module_name = os.path.splitext(os.path.basename(app.file_path))[0]
+            cmd = f"gunicorn {module_name}:app --bind 0.0.0.0:{app.port} --workers 4"
+        elif app.app_type == AppType.PYTHON:
+            # Derive the path to the Python executable within the virtual environment
+            python_executable = self.get_virtualenv_python(app)
+            if not python_executable:
+                st.error(f"Unable to determine Python executable for {app.name}.")
+                return ""
+            cmd = f"{python_executable} {app.file_path}"
+        else:
+            cmd = f"python {app.file_path}"  # Default fallback
+
+        # Append flags if any
+        if app.flags:
+            cmd += " " + " ".join(app.flags)
+
+        # Redirect output to log file
+        nohup_out = os.path.join(self.logs_folder, f"{app.name}.out")
+        cmd += f" &> \"{nohup_out}\" &\n"
+
+        script_lines.append(cmd)
+        return "".join(script_lines)
+
+    def get_virtualenv_python(self, app: AppConfig) -> Optional[str]:
+        """
+        Derive the path to the Python executable based on the environment activation script.
+        Assumes that for venv, the Python executable is located in the same directory as the activate script.
+        """
+        if app.environment_type == EnvironmentType.VENV:
+            activate_path = os.path.expanduser(app.environment_name)
+            # Replace 'bin/activate' with 'bin/python'
+            if activate_path.endswith("bin/activate"):
+                python_path = activate_path.replace("bin/activate", "bin/python")
+                if os.path.exists(python_path):
+                    return python_path
+            elif activate_path.endswith("Scripts/activate"):  # For Windows
+                python_path = activate_path.replace("Scripts/activate", "Scripts/python.exe")
+                if os.path.exists(python_path):
+                    return python_path
+        elif app.environment_type == EnvironmentType.CONDA:
+            # For conda environments, use 'conda run' to execute the Python script within the environment
+            return f"conda run -n {app.environment_name} python"
+        return None
+
+    def start_app(self, app: AppConfig) -> bool:
+        script_content = self.build_startup_script(app)
+        if not script_content:
+            return False  # Error has already been handled in build_startup_script
+        script_path = os.path.join(self.startup_folder, f"{app.name.replace(' ', '_')}.sh")
+
+        try:
+            with open(script_path, "w") as f:
+                f.write(script_content)
+            os.chmod(script_path, 0o755)
+            subprocess.Popen([script_path], shell=True)
+            return True
+        except Exception as e:
+            st.error(f"Failed to start {app.name}: {e}")
+            return False
+
+
+class AppManagerUI:
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        process_manager: ProcessManager,
+        launcher: AppLauncher,
+    ):
+        self.config_manager = config_manager
+        self.process_manager = process_manager
+        self.launcher = launcher
+
+    def display_system_info(self):
+        st.title("Streamlit App Manager")
+
+        # RAM Info
+        memory = psutil.virtual_memory()
+        memory_used = memory.used / 1024**3
+        memory_total = memory.total / 1024**3
+        memory_free = memory_total - memory_used
+        st.write(
+            f"**RAM:** {memory_used:.2f} / {memory_total:.2f} GB ({memory_free:.2f} GB free)"
+        )
+
+        # GPU Info
+        if GPUSTAT_AVAILABLE:
             try:
                 gpu = gpustat.new_query().jsonify()["gpus"][0]
-                processes = gpu["processes"]
-                for process in processes:
-                    if process["pid"] == self.pid:
-                        return process["gpu_memory_usage"]
+                gpu_memory_used = gpu["memory.used"]
+                gpu_memory_total = gpu["memory.total"]
+                gpu_memory_free = gpu_memory_total - gpu_memory_used
+                st.write(
+                    f"**VRAM:** {gpu_memory_used} / {gpu_memory_total} MB ({gpu_memory_free} MB free)"
+                )
             except Exception:
-                return 0
+                st.write("**VRAM:** Unable to retrieve GPU information.")
+
+    def display_apps(self):
+        apps_by_category = itertools.groupby(
+            sorted(self.config_manager.apps, key=lambda app: app.category),
+            key=lambda app: app.category,
+        )
+
+        for category, apps in apps_by_category:
+            expanded = category not in ["Archive", "Miscellaneous"]
+            with st.expander(category, expanded=expanded):
+                for app in apps:
+                    self.display_app_card(app)
+
+    def display_app_card(self, app: AppConfig):
+        proc = self.process_manager.find_app_process(app)
+        is_running = proc is not None
+
+        col1, col2, col3 = st.columns([6, 1, 1])
+        info_col = col1.empty()
+        start_stop_col = col2
+        log_col = col3
+
+        if is_running:
+            local = f"[Local]({LOCAL_IP}:{app.port})" if LOCAL_IP else ""
+            lan = f"[LAN]({LAN_IP}:{app.port})" if LAN_IP else ""
+            wan = f"[WAN]({WAN_IP}:{app.port})" if WAN_IP else ""
+            mem_info = f"RAM: {proc.memory_percent:.2f}%"
+            if proc.gpu_memory:
+                mem_info += f", GPU: {proc.gpu_memory} MB"
+
+            info_col.info(
+                f"**{app.name}** (Port {app.port})\n{local}, {lan}, {wan}\n{mem_info}"
+            )
+            if start_stop_col.button(
+                "Stop", key=f"stop_{app.name}", use_container_width=True, type="primary"
+            ):
+                success = self.process_manager.kill_process(proc)
+                if success:
+                    st.success(f"Stopped {app.name}")
+                    st.rerun()
+                else:
+                    st.error(f"Failed to stop {app.name}")
         else:
-            return 0
+            info_col.warning(f"**{app.name}**\nPort: {app.port}")
+            if start_stop_col.button(
+                "Start", key=f"start_{app.name}", use_container_width=True
+            ):
+                success = self.launcher.start_app(app)
+                if success:
+                    st.success(f"Started {app.name}")
+                    st.rerun()
+                else:
+                    st.error(f"Failed to start {app.name}")
 
+        # Logs
+        show_logs = log_col.checkbox("Logs", key=f"logs_{app.name}")
+        if show_logs:
+            log_file = os.path.join(LOGS_FOLDER, f"{app.name}.out")
+            if os.path.exists(log_file):
+                with open(log_file, "r") as f:
+                    log_content = f.read()
+                html_content = f"<pre>{log_content}</pre>"
+                html(html_content, height=300, scrolling=True)
+            else:
+                st.write("No logs available.")
 
-class AppType(Enum):
-    STREAMLIT = "Streamlit"
-    FASTAPI = "FastAPI"
-
-
-class EnvironmentType(Enum):
-    CONDA = "Conda"
-    VENV = "venv"
-
-
-@dataclass
-class AppConfig:
-    app_name: str
-    file_path: str
-    port: int
-    environment_name: str
-    environment_type: EnvironmentType = EnvironmentType.CONDA
-    app_type: AppType = AppType.STREAMLIT
-    working_dir: Optional[str] = None
+    def run(self):
+        self.display_system_info()
+        self.display_apps()
+        if st.button("Refresh"):
+            st.rerun()
 
 
 def main():
-    st.set_page_config(page_title="Streamlit App Manager")
-    st.title("Streamlit App Manager")
-    memory = psutil.virtual_memory()
-    memory_used = memory.used / 1024**3
-    memory_total = memory.total / 1024**3
-    memory_free = memory_total - memory_used
-    st.write(f"RAM: {memory_used:.2f} / {memory_total:.2f} GB ({memory_free:.2f} GB free)")
+    config_manager = ConfigManager(CONFIG_FILE)
+    config_manager.load_config()
 
-    if _gpustat_available:
-        try:
-            gpu_memory = gpustat.new_query().jsonify()["gpus"][0]
-            gpu_memory_used = gpu_memory["memory.used"]  # / 1024 ** 3
-            gpu_memory_total = gpu_memory["memory.total"]  # / 1024 ** 3
-            gpu_memory_free = gpu_memory_total - gpu_memory_used
-            st.write(f"VRAM: {gpu_memory_used} / {gpu_memory_total} MB ({gpu_memory_free} MB free)")
-        except Exception:
-            pass
+    process_manager = ProcessManager()
+    launcher = AppLauncher(STARTUP_SCRIPTS_FOLDER, LOGS_FOLDER)
 
-    if not os.path.exists("apps.yml"):
-        st.error("No apps.yml file found. Please create one.")
-        st.stop()
-
-    with open("apps.yml", "r") as f:
-        apps = yaml.safe_load(f)
-
-    processes = [Process.from_psutil_process(p) for p in psutil.process_iter()]
-
-    for app in list(apps.keys()):
-        if apps[app].get("Category") is None:
-            apps[app]["Category"] = "Uncategorized"
-
-    apps = {k: v for k, v in sorted(apps.items(), key=lambda item: item[1].get("Category", ""))}
-    apps = {
-        k: list(g)
-        for k, g in itertools.groupby(apps.items(), key=lambda item: item[1].get("Category", ""))
-    }
-
-    for category, apps in apps.items():
-        expanded = category != "Archive" and category != "Miscellaneous"
-        with st.expander(category, expanded=expanded):
-            for app_name, app_info in apps:
-                for p in processes:
-                    cmdline = " ".join(p.cmdline)
-
-                    if not cmdline:
-                        continue
-
-                    port_in_proc = str(app_info["Port"]) in cmdline
-                    file_in_proc = os.path.basename(app_info["File"]) in cmdline
-
-                    if app_info.get("Type", "streamlit").lower() == "streamlit":
-                        app_running = port_in_proc and file_in_proc and "streamlit" in cmdline
-                    elif app_info.get("Type").lower() == "fastapi":
-                        app_running = port_in_proc and "uvicorn" in cmdline
-
-                    if app_running:
-                        app_info["Running"] = app_running
-                        app_info["PID"] = p.pid
-                        app_info["Process"] = p
-                        app_info["Memory"] = p.memory_percent
-                        app_info["GPU"] = p.gpu_memory
-                        break
-                else:
-                    app_info["Running"] = False
-
-            self_cwd = os.getcwd()
-
-            for app_name, app_info in apps:
-                col1, col2, col3 = st.columns([6, 1, 1])
-                info_col = col1.empty()
-                view_logs = col3.checkbox("Logs", key=f"view_logs_{app_name}")
-
-                start_stop = col2.empty()
-
-                if app_info["Running"]:
-                    port = app_info["Port"]
-
-                    local = f"[Local]({local_ip}:{port}), " if local_ip else ""
-                    lan = f"[LAN]({lan_ip}:{port}), " if lan_ip else ""
-                    wan = f"[WAN]({wan_ip}:{port})"
-                    mem_info = f"RAM: {app_info['Memory']:.2f}%"
-                    if app_info["GPU"] is not None:
-                        mem_info += f", GPU: {app_info['GPU']} MB"
-
-                    info_col.info(
-                        f"{app_name} (Port {app_info['Port']}) at {local} {lan} {wan} ({mem_info})"
-                    )
-                    stop_sig = start_stop.button(
-                        "Toggle",
-                        key=f"stop_button_{app_name}",
-                        on_click=app_kill,  # app_info["Process"].kill,
-                        args=[app_info],
-                    )
-
-                else:
-                    info_col.warning(f"{app_name}")
-                    start_sig = start_stop.button("Toggle", key=f"start_button_{app_name}")
-
-                    if start_sig:
-                        nohup_out = (
-                            '"' + os.path.join(self_cwd, logs_folder, app_name + ".out") + '"'
-                        )
-                        app_file = '"' + app_info["File"] + '"'
-                        if app_info.get("WorkingDirectory"):
-                            app_wd = '"' + app_info["WorkingDirectory"] + '"'
-                        else:
-                            app_wd = '"' + os.path.dirname(app_info["File"]) + '"'
-                        startup_script_shebang = "#! /bin/bash\n"
-
-                        environment_type = app_info.get("EnvironmentType", "conda").lower()
-                        app_type = app_info.get("Type", "streamlit").lower()
-
-                        flags = app_info.get("Flags", [])
-                        env_vars = app_info.get("EnvironmentVariables", {})
-
-                        startup_script = []
-
-                        if env_vars is not None:
-                            for env_var in env_vars:
-                                startup_script.append(f"export {env_var}\n")
-
-                        if environment_type == "conda":
-                            app_env = app_info["Environment"]
-                            startup_script += [
-                                "source",
-                                conda_activate,
-                                "&&",
-                                "conda",
-                                "activate",
-                                app_env,
-                                "&&",
-                                "cd",
-                                app_wd,
-                                "&&",
-                            ]
-                        elif environment_type == "venv":
-                            app_env = '"' + app_info["Environment"] + '"'
-                            startup_script += [
-                                "source",
-                                app_env,
-                                "&&",
-                                "cd",
-                                app_wd,
-                                "&&",
-                            ]
-
-                        if app_type == "streamlit":
-                            app_port_config = f"--server.port={app_info['Port']}"
-                            startup_script.extend(
-                                [
-                                    "nohup",
-                                    "streamlit",
-                                    "run",
-                                    app_file,
-                                    app_port_config,
-                                    "--server.fileWatcherType=none",
-                                    "--server.headless=true",
-                                    "--browser.gatherUsageStats=false",
-                                ]
-                            )
-                        elif app_type == "fastapi":
-                            app_port_config = f"--port {app_info['Port']}"
-                            uvicorn_launch_token = os.path.split(app_file)[1].split(".")[0] + ":app"
-                            startup_script.extend(
-                                [
-                                    "nohup",
-                                    "uvicorn",
-                                    uvicorn_launch_token,
-                                    "--host 0.0.0.0",
-                                    app_port_config,
-                                    # "--reload",
-                                ]
-                            )
-
-                        startup_script.extend(flags)
-                        startup_script.extend(["&>", nohup_out, "&"])
-
-                        run_script_name = app_name.replace(" ", "_") + ".sh"
-                        run_script_path = os.path.join(startup_scripts_folder, run_script_name)
-                        with open(run_script_path, "w") as f:
-                            f.write(startup_script_shebang + " ".join(startup_script))
-
-                        subprocess.Popen(["chmod", "u+rx", f"{run_script_path}"])
-                        subprocess.call(f"{run_script_path}")
-
-                        port = app_info["Port"]
-                        local = f"[Local]({local_ip}:{port}), " if local_ip else ""
-                        lan = f"[LAN]({lan_ip}:{port}), " if lan_ip else ""
-                        wan = f"[WAN]({wan_ip}:{port})"
-                        info_col.info(f"{app_name} (Port: {port}) at {local} {lan} {wan}")
-
-                if view_logs:
-                    log_file = os.path.join(self_cwd, logs_folder, app_name + ".out")
-                    if os.path.exists(log_file):
-                        with open(log_file, "r") as f:
-                            log_text = f.read()
-                            log_html = "<pre>" + log_text + "</pre>"
-                            html(log_html, height=200, scrolling=True)
-
-    st.button("Refresh")
+    ui = AppManagerUI(config_manager, process_manager, launcher)
+    ui.run()
 
 
 if __name__ == "__main__":
