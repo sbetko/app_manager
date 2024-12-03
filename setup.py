@@ -17,6 +17,7 @@ setup(
         "pyyaml",
         "uvicorn",
         "gunicorn",
+        "python-dotenv",
     ],
     entry_points={
         "console_scripts": [
