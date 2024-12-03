@@ -6,11 +6,16 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
+import time
 
 import psutil
 import streamlit as st
 import yaml
 from streamlit.components.v1 import html
+
+__author__ = "Sage Betko"
+__copyright__ = "Sage Betko"
+__license__ = "MIT"
 
 try:
     import gpustat
@@ -30,6 +35,29 @@ CONFIG_FILE = os.path.abspath("apps.yml")
 
 os.makedirs(STARTUP_SCRIPTS_FOLDER, exist_ok=True)
 os.makedirs(LOGS_FOLDER, exist_ok=True)
+
+LOG_CONTAINER_CSS = """
+<style>
+    .log-container {
+        border: 1px solid #ccc;
+        padding: 10px;
+        border-radius: 20px;
+        margin-left: 20px;  /* Indent the box */
+    }
+    .log-container pre {
+        margin-left: 20px;  /* Indent the text */
+    }
+</style>
+"""
+
+
+def create_log_container_html(log_content: str) -> str:
+    return f"""
+    {LOG_CONTAINER_CSS}
+    <div class="log-container" style="overflow-x: auto;">
+        <pre>{log_content}</pre>
+    </div>
+    """
 
 
 class AppType(Enum):
@@ -56,6 +84,8 @@ class AppConfig:
     flags: List[str] = field(default_factory=list)
     environment_variables: Dict[str, str] = field(default_factory=dict)
     working_directory: Optional[str] = None
+    public_url: Optional[str] = None  # New field
+
 
     @staticmethod
     def from_dict(name: str, config: Dict) -> AppConfig:
@@ -70,6 +100,7 @@ class AppConfig:
             flags=config.get("Flags", []),
             environment_variables=config.get("EnvironmentVariables", {}),
             working_directory=config.get("WorkingDirectory"),
+            public_url=config.get("PublicURL"),
         )
 
 
@@ -116,21 +147,23 @@ class ConfigManager:
 
     def load_config(self) -> None:
         if not os.path.exists(self.config_path):
-            st.error("No apps.yml file found. Please create one.")
+            expected_dir = os.path.dirname(self.config_path)
+            st.error(f"No apps.yml file found in {expected_dir}. Please create one.")
             example_config = """\
 # apps.yml
 # Example configuration file for Streamlit App Manager
 # Each app should be a new entry in the yaml file
 Test App:
   File: /path/to/test_app.py
-  Port: 8501
+  Port: 8501 # Required for Streamlit, FastAPI, and Flask apps
   Environment: [conda|venv] env_name | path/to/venv/bin/activate
   EnvironmentType: [conda|venv]
   Type: [streamlit|fastapi|flask|python]
-  Category: Uncategorized
+  Category: Uncategorized # Optional, defaults to 'Uncategorized'
   Flags: []
   EnvironmentVariables: {}
-  WorkingDirectory: /path/to/working/directory
+  WorkingDirectory: /path/to/working/directory # defaults to app's directory
+  PublicURL: https://yourdomain.com/test-app # Optional
 """
             st.code(example_config, language="yaml")
             st.stop()
@@ -197,9 +230,10 @@ class ProcessManager:
 
 
 class AppLauncher:
-    def __init__(self, startup_folder: str, logs_folder: str):
+    def __init__(self, startup_folder: str, logs_folder: str, process_manager: ProcessManager):
         self.startup_folder = startup_folder
         self.logs_folder = logs_folder
+        self.process_manager = process_manager
 
     def build_startup_script(self, app: AppConfig) -> str:
         script_lines = ["#!/bin/bash\n"]
@@ -271,12 +305,13 @@ class AppLauncher:
                 if os.path.exists(python_path):
                     return python_path
         elif app.environment_type == EnvironmentType.CONDA:
-            # For conda environments, use 'conda run' to execute the Python script within the environment
             return f"conda run -n {app.environment_name} python"
         return None
 
-    def start_app(self, app: AppConfig) -> bool:
+    def start_app(self, app: AppConfig, st_element: Optional[st.delta_generator.DeltaGenerator] = None) -> bool:
+        st_element = st_element or st
         script_content = self.build_startup_script(app)
+        st.empty()
         if not script_content:
             return False  # Error has already been handled in build_startup_script
         script_path = os.path.join(self.startup_folder, f"{app.name.replace(' ', '_')}.sh")
@@ -286,9 +321,24 @@ class AppLauncher:
                 f.write(script_content)
             os.chmod(script_path, 0o755)
             subprocess.Popen([script_path], shell=True)
-            return True
+
+            # Wait for the app to be detected as running
+            pbar_text = f"Starting {app.name}..."
+            my_bar = st_element.progress(0, text=pbar_text)
+            num_attempts = 5
+            delay_seconds = 0.25
+            for attempt_num in range(num_attempts):
+                self.process_manager.processes = self.process_manager._get_managed_processes()
+                if self.process_manager.find_app_process(app):
+                    my_bar.progress(1.0, f"Started {pbar_text}.")
+                    return True
+                my_bar.progress(((attempt_num + 1) / num_attempts), text=pbar_text)
+                time.sleep(delay_seconds)
+
+            st_element.error(f"App {app.name} did not start within the expected time. It may be delayed or failed to start.")
+            return False
         except Exception as e:
-            st.error(f"Failed to start {app.name}: {e}")
+            st_element.error(f"Failed to start {app.name}: {e}")
             return False
 
 
@@ -344,52 +394,80 @@ class AppManagerUI:
         proc = self.process_manager.find_app_process(app)
         is_running = proc is not None
 
-        col1, col2, col3 = st.columns([6, 1, 1])
-        info_col = col1.empty()
-        start_stop_col = col2
-        log_col = col3
+        def create_app_status_str(proc: ManagedProcess) -> str:
+            urls = []
+            if LOCAL_IP and app.port:
+                urls.append(f"[Local]({LOCAL_IP}:{app.port})")
+            if LAN_IP and app.port:
+                urls.append(f"[LAN]({LAN_IP}:{app.port})")
+            if WAN_IP and app.port:
+                urls.append(f"[WAN]({WAN_IP}:{app.port})")
+            if app.public_url:
+                urls.append(f"[Public]({app.public_url})")  # Add Public URL
 
-        if is_running:
-            local = f"[Local]({LOCAL_IP}:{app.port})" if LOCAL_IP else ""
-            lan = f"[LAN]({LAN_IP}:{app.port})" if LAN_IP else ""
-            wan = f"[WAN]({WAN_IP}:{app.port})" if WAN_IP else ""
+            url_str = ", ".join(urls)
             mem_info = f"RAM: {proc.memory_percent:.2f}%"
             if proc.gpu_memory:
                 mem_info += f", GPU: {proc.gpu_memory} MB"
 
-            info_col.info(
-                f"**{app.name}** (Port {app.port})\n{local}, {lan}, {wan}\n{mem_info}"
-            )
-            if start_stop_col.button(
+            return f"**{app.name}** (Port {app.port})\n{url_str}\n{mem_info}"
+
+        col1, col2, col3 = st.columns([6, 1, 1])
+        info_col = col1.empty()
+        info_element = info_col.empty()
+        start_stop_col = col2
+        start_stop_element = start_stop_col.empty()
+        log_col = col3
+
+        # Keep track of the user's action, so we can update the UI accordingly
+        # without having to refresh the entire page, which resets toast messages
+        user_stopped_app = False
+        user_started_app = False
+
+        if is_running:
+            info_element.info(create_app_status_str(proc))
+            if start_stop_element.button(
                 "Stop", key=f"stop_{app.name}", use_container_width=True, type="primary"
             ):
-                success = self.process_manager.kill_process(proc)
+                with st.spinner("Stopping..."):
+                    success = self.process_manager.kill_process(proc)
                 if success:
-                    st.success(f"Stopped {app.name}")
-                    st.rerun()
+                    st.toast(f"Stopped **{app.name}**", icon=":material/cancel:")
+                    user_stopped_app = True
                 else:
-                    st.error(f"Failed to stop {app.name}")
-        else:
-            info_col.warning(f"**{app.name}**\nPort: {app.port}")
-            if start_stop_col.button(
+                    st.error(f"Failed to stop **{app.name}**")
+
+        if not is_running or user_stopped_app:
+            info_element.warning(f"**{app.name}**\nPort: {app.port}")
+            if start_stop_element.button(
                 "Start", key=f"start_{app.name}", use_container_width=True
             ):
-                success = self.launcher.start_app(app)
+                success = self.launcher.start_app(app, st_element=info_element)
                 if success:
-                    st.success(f"Started {app.name}")
-                    st.rerun()
+                    st.toast(f"Started **{app.name}**", icon=":material/done_all:")
+                    user_started_app = True
                 else:
-                    st.error(f"Failed to start {app.name}")
+                    st.toast(f"Failed to start **{app.name}**")
 
-        # Logs
+        if user_started_app:
+            proc = self.process_manager.find_app_process(app)
+            info_element.info(create_app_status_str(proc))
+            start_stop_element.button(
+                "Stop", key=f"stop_{app.name}", use_container_width=True, type="primary"
+            )
+
+        self.display_logs(app, log_col)
+
+    def display_logs(self, app: AppConfig, log_col):
         show_logs = log_col.checkbox("Logs", key=f"logs_{app.name}")
         if show_logs:
             log_file = os.path.join(LOGS_FOLDER, f"{app.name}.out")
             if os.path.exists(log_file):
                 with open(log_file, "r") as f:
                     log_content = f.read()
-                html_content = f"<pre>{log_content}</pre>"
-                html(html_content, height=300, scrolling=True)
+                html_content = create_log_container_html(log_content)
+                height = min(300, max(len(log_content.split("\n")) * 20, 50))
+                html(html_content, height=height, scrolling=True)
             else:
                 st.write("No logs available.")
 
@@ -405,7 +483,7 @@ def main():
     config_manager.load_config()
 
     process_manager = ProcessManager()
-    launcher = AppLauncher(STARTUP_SCRIPTS_FOLDER, LOGS_FOLDER)
+    launcher = AppLauncher(STARTUP_SCRIPTS_FOLDER, LOGS_FOLDER, process_manager)
 
     ui = AppManagerUI(config_manager, process_manager, launcher)
     ui.run()

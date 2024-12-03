@@ -1,17 +1,25 @@
-"""
-    Setup file for app_manager.
-    Use setup.cfg to configure your project.
-"""
-from setuptools import setup
+from setuptools import setup, find_packages
 
-if __name__ == "__main__":
-    try:
-        setup(use_scm_version={"version_scheme": "no-guess-dev"})
-    except:  # noqa
-        print(
-            "\n\nAn error occurred while building the project, "
-            "please ensure you have the most updated version of setuptools, "
-            "setuptools_scm and wheel with:\n"
-            "   pip install -U setuptools setuptools_scm wheel\n\n"
-        )
-        raise
+setup(
+    name="app_manager",
+    version="0.1.0",
+    packages=find_packages(),
+    include_package_data=True,
+    package_data={
+        'app_manager': ['tests/apps/*.py', 'tests/apps/apps.yml'],
+    },
+    install_requires=[
+        "streamlit",
+        "fastapi",
+        "flask",
+        "psutil",
+        "pyyaml",
+        "uvicorn",
+        "gunicorn",
+    ],
+    entry_points={
+        "console_scripts": [
+            "app-manager=app_manager.manager:main",
+        ],
+    },
+)

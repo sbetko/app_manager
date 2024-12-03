@@ -1,0 +1,7 @@
+streamlit
+fastapi
+flask
+psutil
+pyyaml
+uvicorn
+gunicorn

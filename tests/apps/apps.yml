@@ -1,0 +1,47 @@
+# apps.yaml
+# Configuration file for Streamlit App Manager
+
+Test Streamlit App:
+  File: ./test_streamlit_app.py
+  Port: 8502
+  Environment: ~/.python-envs/misc/bin/activate
+  EnvironmentType: venv
+  Type: streamlit
+  Category: Data Apps
+  Flags: []
+  EnvironmentVariables: {}
+  WorkingDirectory: "."
+
+Test FastAPI App:
+  File: ./test_fastapi_app.py
+  Port: 8000
+  Environment: ~/.python-envs/misc/bin/activate
+  EnvironmentType: venv
+  Type: fastapi
+  Category: API Services
+  Flags: []
+  EnvironmentVariables: {}
+  WorkingDirectory: "."
+
+Test Flask App:
+  File: ./test_flask_app.py
+  Port: 5001
+  Environment: ~/.python-envs/misc/bin/activate
+  EnvironmentType: venv
+  Type: flask
+  Category: Web Services
+  Flags: ["--workers", "4"]
+  EnvironmentVariables:
+    FLASK_ENV: production
+  WorkingDirectory: "."
+
+Arbitrary Python Script:
+  File: ./test_python_app.py
+  Port: 9000
+  Environment: ~/.python-envs/misc/bin/activate
+  EnvironmentType: venv
+  Type: python
+  Category: Scripts
+  Flags: []
+  EnvironmentVariables: {}
+  WorkingDirectory: "."
