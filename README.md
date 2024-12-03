@@ -15,7 +15,13 @@ pip install git+https://github.com/sbetko/app_manager.git
 To start the app manager, run:
 
 ```shell
-streamlit-app-manager
+app-manager
+```
+
+You can also pass arguments/flags to Streamlit:
+
+```shell
+app-manager --server.port 8501 --server.headless true
 ```
 
 ## Development
@@ -31,7 +37,7 @@ pip install -r requirements.txt
 You can then run the manager locally:
 
 ```shell
-python -m app_manager.manager
+python -m app_manager.run_manager
 ```
 
 ## Running with Test Apps
