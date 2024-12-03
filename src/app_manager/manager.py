@@ -166,17 +166,18 @@ class ConfigManager:
 # apps.yml
 # Example configuration file for Streamlit App Manager
 # Each app should be a new entry in the yaml file
+
 Test App:
-  File: /path/to/test_app.py
-  Port: 8501 # Required for Streamlit, FastAPI, and Flask apps
-  Environment: [conda|venv] env_name | path/to/venv/bin/activate
-  EnvironmentType: [conda|venv]
-  Type: [streamlit|fastapi|flask|python]
-  Category: Uncategorized # Optional, defaults to 'Uncategorized'
-  Flags: []
-  EnvironmentVariables: {}
-  WorkingDirectory: /path/to/working/directory # defaults to app's directory
-  PublicURL: https://yourdomain.com/test-app # Optional
+  File: /path/to/test_app.py  # Path to the application script
+  Port: 8501                 # Required for Streamlit, FastAPI, and Flask apps
+  Environment: conda|venv env_name | path/to/venv/bin/activate
+  EnvironmentType: [conda|venv]  # Specify the environment type
+  Type: [streamlit|fastapi|flask|python]  # Type of application
+  Category: Uncategorized     # Optional, defaults to 'Uncategorized'
+  Flags: []                   # Optional command-line flags
+  EnvironmentVariables: {}    # Optional environment variables
+  WorkingDirectory: /path/to/working/directory  # Defaults to app's directory
+  PublicURL: https://yourdomain.com/test-app  # Optional public-facing URL
 """
             st.code(example_config, language="yaml")
             st.stop()
