@@ -20,7 +20,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "app-manager=app_manager.manager:main",
+            "app-manager=run_manager:main",
         ],
     },
 )
