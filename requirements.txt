@@ -5,3 +5,4 @@ psutil
 pyyaml
 uvicorn
 gunicorn
+python-dotenv

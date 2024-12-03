@@ -3,14 +3,15 @@ from __future__ import annotations
 import itertools
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
-import time
 
 import psutil
 import streamlit as st
 import yaml
+from dotenv import load_dotenv
 from streamlit.components.v1 import html
 
 __author__ = "Sage Betko"
@@ -24,17 +25,28 @@ try:
 except ImportError:
     GPUSTAT_AVAILABLE = False
 
-CONDA_ACTIVATE_SCRIPT = os.path.expanduser("~/mambaforge/etc/profile.d/conda.sh")
-LOCAL_IP = "http://localhost"
-LAN_IP = "http://192.168.40.191"
-WAN_IP = "http://24.239.193.76"
 
-STARTUP_SCRIPTS_FOLDER = os.path.abspath("./startup_scripts")
-LOGS_FOLDER = os.path.abspath("./logs")
-CONFIG_FILE = os.path.abspath("apps.yml")
+# Load environment variables from a .env file if present
+load_dotenv()
+
+# Retrieve IP addresses from environment variables with default values
+LOCAL_IP = os.getenv("LOCAL_IP", "http://localhost")
+LAN_IP = os.getenv("LAN_IP")
+WAN_IP = os.getenv("WAN_IP")
+
+# Construct paths relative to the current working directory
+BASE_DIR = os.getcwd()
+STARTUP_SCRIPTS_FOLDER = os.path.join(BASE_DIR, "startup_scripts")
+LOGS_FOLDER = os.path.join(BASE_DIR, "logs")
+CONFIG_FILE = os.path.join(BASE_DIR, "apps.yml")
 
 os.makedirs(STARTUP_SCRIPTS_FOLDER, exist_ok=True)
 os.makedirs(LOGS_FOLDER, exist_ok=True)
+
+# Update CONDA_ACTIVATE_SCRIPT to use environment variable or relative path
+CONDA_ACTIVATE_SCRIPT = os.getenv(
+    "CONDA_ACTIVATE_SCRIPT", os.path.expanduser("~/mambaforge/etc/profile.d/conda.sh")
+)
 
 LOG_CONTAINER_CSS = """
 <style>
@@ -86,7 +98,6 @@ class AppConfig:
     working_directory: Optional[str] = None
     public_url: Optional[str] = None  # New field
 
-
     @staticmethod
     def from_dict(name: str, config: Dict) -> AppConfig:
         return AppConfig(
@@ -94,7 +105,9 @@ class AppConfig:
             file_path=config["File"],
             port=config.get("Port"),
             environment_name=config["Environment"],
-            environment_type=EnvironmentType(config.get("EnvironmentType", "conda").lower()),
+            environment_type=EnvironmentType(
+                config.get("EnvironmentType", "conda").lower()
+            ),
             app_type=AppType(config.get("Type", "streamlit").lower()),
             category=config.get("Category", "Uncategorized"),
             flags=config.get("Flags", []),
@@ -180,7 +193,9 @@ class ProcessManager:
 
     def _get_managed_processes(self) -> List[ManagedProcess]:
         managed = []
-        for p in psutil.process_iter(['pid', 'cmdline', 'name', 'status', 'create_time']):
+        for p in psutil.process_iter(
+            ["pid", "cmdline", "name", "status", "create_time"]
+        ):
             try:
                 managed.append(ManagedProcess.from_psutil_process(p))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -204,10 +219,9 @@ class ProcessManager:
                     return proc
             else:
                 # For apps without ports, use the file path to identify the process
-                if (
-                    app.app_type == AppType.PYTHON
-                    and os.path.abspath(app.file_path) in [os.path.abspath(arg) for arg in proc.cmdline]
-                ):
+                if app.app_type == AppType.PYTHON and os.path.abspath(
+                    app.file_path
+                ) in [os.path.abspath(arg) for arg in proc.cmdline]:
                     return proc
                 elif (
                     app.app_type == AppType.PYTHON
@@ -230,7 +244,9 @@ class ProcessManager:
 
 
 class AppLauncher:
-    def __init__(self, startup_folder: str, logs_folder: str, process_manager: ProcessManager):
+    def __init__(
+        self, startup_folder: str, logs_folder: str, process_manager: ProcessManager
+    ):
         self.startup_folder = startup_folder
         self.logs_folder = logs_folder
         self.process_manager = process_manager
@@ -244,7 +260,9 @@ class AppLauncher:
 
         # Activate environment
         if app.environment_type == EnvironmentType.CONDA:
-            script_lines.append(f"source {CONDA_ACTIVATE_SCRIPT} && conda activate {app.environment_name} && \\\n")
+            script_lines.append(
+                f"source {CONDA_ACTIVATE_SCRIPT} && conda activate {app.environment_name} && \\\n"
+            )
         elif app.environment_type == EnvironmentType.VENV:
             script_lines.append(f"source {app.environment_name} && \\\n")
 
@@ -283,7 +301,7 @@ class AppLauncher:
 
         # Redirect output to log file
         nohup_out = os.path.join(self.logs_folder, f"{app.name}.out")
-        cmd += f" &> \"{nohup_out}\" &\n"
+        cmd += f' &> "{nohup_out}" &\n'
 
         script_lines.append(cmd)
         return "".join(script_lines)
@@ -301,20 +319,28 @@ class AppLauncher:
                 if os.path.exists(python_path):
                     return python_path
             elif activate_path.endswith("Scripts/activate"):  # For Windows
-                python_path = activate_path.replace("Scripts/activate", "Scripts/python.exe")
+                python_path = activate_path.replace(
+                    "Scripts/activate", "Scripts/python.exe"
+                )
                 if os.path.exists(python_path):
                     return python_path
         elif app.environment_type == EnvironmentType.CONDA:
             return f"conda run -n {app.environment_name} python"
         return None
 
-    def start_app(self, app: AppConfig, st_element: Optional[st.delta_generator.DeltaGenerator] = None) -> bool:
+    def start_app(
+        self,
+        app: AppConfig,
+        st_element: Optional[st.delta_generator.DeltaGenerator] = None,
+    ) -> bool:
         st_element = st_element or st
         script_content = self.build_startup_script(app)
         st.empty()
         if not script_content:
             return False  # Error has already been handled in build_startup_script
-        script_path = os.path.join(self.startup_folder, f"{app.name.replace(' ', '_')}.sh")
+        script_path = os.path.join(
+            self.startup_folder, f"{app.name.replace(' ', '_')}.sh"
+        )
 
         try:
             with open(script_path, "w") as f:
@@ -328,14 +354,18 @@ class AppLauncher:
             num_attempts = 5
             delay_seconds = 0.25
             for attempt_num in range(num_attempts):
-                self.process_manager.processes = self.process_manager._get_managed_processes()
+                self.process_manager.processes = (
+                    self.process_manager._get_managed_processes()
+                )
                 if self.process_manager.find_app_process(app):
                     my_bar.progress(1.0, f"Started {pbar_text}.")
                     return True
                 my_bar.progress(((attempt_num + 1) / num_attempts), text=pbar_text)
                 time.sleep(delay_seconds)
 
-            st_element.error(f"App {app.name} did not start within the expected time. It may be delayed or failed to start.")
+            st_element.error(
+                f"App {app.name} did not start within the expected time. It may be delayed or failed to start."
+            )
             return False
         except Exception as e:
             st_element.error(f"Failed to start {app.name}: {e}")

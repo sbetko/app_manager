@@ -24,6 +24,16 @@ You can also pass arguments/flags to Streamlit:
 app-manager --server.port 8501 --server.headless true
 ```
 
+## Setup Environment Variables
+
+Create a `.env` file in the project root based on the `.env.example`:
+
+```bash
+cp .env.example .env
+```
+
+Update the .env file with your specific configurations.
+
 ## Development
 
 Clone the repository and install the dependencies:
